@@ -1,2 +1,2 @@
-# Supabase project binding
-project_ref = "zpppzzwaoplfeoiynkam"
+# Supabase project binding (CLI читает project_id)
+project_id = "zpppzzwaoplfeoiynkam"
