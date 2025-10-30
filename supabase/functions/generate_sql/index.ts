@@ -1,29 +1,42 @@
 // @ts-nocheck
-// supabase/functions/generate_sql/index.ts
-// Генерация SQL через OpenAI + предупреждения и готовые варианты (обычный и с SAVEPOINT)
+// Supabase Edge Function: generate_sql
+// Генерация SQL через OpenAI с учётом диалекта (Postgres, MySQL, SQLite и т.д.)
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
-  "Access-Control-Allow-Methods": "POST, OPTIONS"
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
 };
 
-// ---------- Служебки ----------
+// 🔧 Системный промпт
 function buildSystemPrompt(dialect: string) {
   return [
-    "You are an expert SQL generator.",
-    "Return ONLY a single SQL statement. No prose, no markdown, no triple backticks.",
-    "Target dialect: " + dialect + ".",
-    "RULES:",
-    "- Use ONLY real table and column names from the provided schema if present.",
-    "- Prefer explicit JOINs; qualify columns when helpful.",
-    "- If user asks for mutating ops (DELETE/UPDATE/INSERT/etc), generate them plainly — do not add transactions."
+    "Ты — эксперт SQL-генератор.",
+    "Возвращай только корректный SQL без объяснений.",
+    `Текущий SQL диалект: ${dialect.toUpperCase()}.`,
+    "Используй реальные таблицы и колонки из схемы, если они предоставлены.",
+    "Добавь SAVEPOINT-логику для опасных операций (DROP, DELETE, ALTER и т.д.).",
   ].join(" ");
 }
 
+// 🔧 Основная функция OpenAI
 async function callOpenAI(nl: string, schemaText?: string, dialect = "postgres") {
   const apiKey = Deno.env.get("OPENAI_API_KEY");
-  if (!apiKey) throw new Error("OPENAI_API_KEY is not set");
+  if (!apiKey) throw new Error("OPENAI_API_KEY не задан");
+
+  const prompt = `
+Ты SQL-ассистент. 
+Пользователь просит сгенерировать SQL-запрос для диалекта ${dialect.toUpperCase()}.
+
+Схема базы данных (JSON или текст):
+${schemaText || "(пусто)"}
+
+Текст запроса пользователя:
+"${nl}"
+
+Сгенерируй корректный SQL под этот диалект.
+Если какой-то синтаксис не поддерживается — используй ближайший аналог.
+  `.trim();
 
   const resp = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
@@ -37,54 +50,43 @@ async function callOpenAI(nl: string, schemaText?: string, dialect = "postgres")
       top_p: 0.9,
       messages: [
         { role: "system", content: buildSystemPrompt(dialect) },
-        {
-          role: "user",
-          content: schemaText
-            ? `Database schema (JSON):\n${schemaText}\n\nUser request: ${nl}`
-            : `User request: ${nl}`,
-        },
+        { role: "user", content: prompt },
       ],
     }),
   });
 
   if (!resp.ok) {
-    const t = await resp.text().catch(() => "");
-    throw new Error(`OpenAI error ${resp.status}: ${t}`);
+    const text = await resp.text().catch(() => "");
+    throw new Error(`OpenAI error ${resp.status}: ${text}`);
   }
 
   const data = await resp.json();
-  const sql = data?.choices?.[0]?.message?.content?.trim?.() ?? "";
-  const usage = data?.usage ?? null;
-  if (!sql) throw new Error("Empty SQL from model");
+  const sql = data?.choices?.[0]?.message?.content?.trim() || "";
+  const usage = data?.usage || {};
+  if (!sql) throw new Error("Модель вернула пустой SQL");
 
   return { sql, usage };
 }
 
-// ---------- Предупреждения о «опасных» операторах ----------
-const DANGER_RE = /\b(DROP|ALTER|TRUNCATE|CREATE|GRANT|REVOKE|DELETE|UPDATE|INSERT|MERGE)\b/i;
-
-function detectDanger(sql: string) {
-  const found = new Set<string>();
-  const tokens = ["DROP","ALTER","TRUNCATE","CREATE","GRANT","REVOKE","DELETE","UPDATE","INSERT","MERGE"];
-  for (const t of tokens) {
-    const re = new RegExp(`\\b${t}\\b`, "i");
-    if (re.test(sql)) found.add(t);
-  }
-  return Array.from(found);
+// 🚨 Проверка на опасные операции
+function detectDangerousOps(sql: string) {
+  const tokens = ["DROP", "ALTER", "TRUNCATE", "DELETE", "UPDATE", "INSERT", "MERGE"];
+  return tokens.filter((t) => new RegExp(`\\b${t}\\b`, "i").test(sql));
 }
 
+// 🚧 Обёртка в SAVEPOINT
 function wrapWithSavepoint(sql: string, savepointName = "ai_guard") {
   return [
     "BEGIN;",
     `SAVEPOINT ${savepointName};`,
     sql,
-    `ROLLBACK TO SAVEPOINT ${savepointName}; -- если нужно отменить`,
-    "COMMIT; -- когда уверены в результате",
+    `ROLLBACK TO SAVEPOINT ${savepointName}; -- безопасный откат`,
+    "COMMIT;",
   ].join("\n");
 }
 
+// 🧠 Основная функция Supabase Edge
 Deno.serve(async (req) => {
-  // CORS preflight
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
   }
@@ -99,51 +101,45 @@ Deno.serve(async (req) => {
 
     const payload = await req.json().catch(() => ({}));
     const nl: string = payload?.nl ?? "";
+    const schema = payload?.schema ?? "";
+    const dialect: string = payload?.dialect ?? "postgres";
+
     if (!nl || typeof nl !== "string") {
-      return new Response(JSON.stringify({ error: "Field 'nl' is required (string)" }), {
+      return new Response(JSON.stringify({ error: "Поле 'nl' обязательно" }), {
         status: 400,
         headers: { "Content-Type": "application/json", ...corsHeaders },
       });
     }
 
-    const dialect = (payload?.dialect as string) || "postgres";
-    let schemaText: string | undefined;
-    if (payload?.schema && typeof payload.schema === "object") {
-      try { schemaText = JSON.stringify(payload.schema); } catch { /* noop */ }
-    } else if (typeof payload?.schema === "string") {
-      schemaText = payload.schema;
-    }
+    const schemaText =
+      typeof schema === "object" ? JSON.stringify(schema) : String(schema);
 
-    // Генерим SQL
     const { sql, usage } = await callOpenAI(nl.trim(), schemaText, dialect);
 
-    // Определяем «опасность»
-    const dangers = detectDanger(sql);
-    const isDanger = dangers.length > 0;
+    const dangers = detectDangerousOps(sql);
+    const hasDanger = dangers.length > 0;
 
-    // Готовим варианты: обычный и с SAVEPOINT
-    const variantPlain = sql;
-    const variantSavepoint = wrapWithSavepoint(sql);
+    const response = {
+      sql,
+      withSafety: hasDanger ? wrapWithSavepoint(sql) : sql,
+      raw: sql,
+      warnings: hasDanger
+        ? [`⚠️ Обнаружены потенциально опасные операции: ${dangers.join(", ")}`]
+        : [],
+      usage,
+    };
 
-    // (для обратной совместимости — если фронт вдруг ещё читает это поле)
-    const withSafety = variantSavepoint; // без «(ваш запрос ниже)»
-
-    return new Response(
-      JSON.stringify({
-        blocked: false,
-        sql: variantPlain,          // базовый SQL
-        withSafety,                 // совместимость
-        variantPlain,               // обычный
-        variantSavepoint,           // транзакционный с SAVEPOINT
-        dangers,                    // массив найденных опасных операторов
-        usage,                      // openai usage (если нужен для учёта)
-      }),
-      { status: 200, headers: { "Content-Type": "application/json", ...corsHeaders } }
-    );
-  } catch (e: any) {
-    return new Response(JSON.stringify({ error: String(e?.message ?? e) }), {
-      status: 500,
+    return new Response(JSON.stringify(response), {
+      status: 200,
       headers: { "Content-Type": "application/json", ...corsHeaders },
     });
+  } catch (e: any) {
+    return new Response(
+      JSON.stringify({ error: e?.message || String(e) }),
+      {
+        status: 500,
+        headers: { "Content-Type": "application/json", ...corsHeaders },
+      }
+    );
   }
 });
